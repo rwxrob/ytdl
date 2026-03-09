@@ -2,137 +2,126 @@ package ytdl
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/kkdai/youtube/v2"
 )
 
 type DownloadOptions struct {
-	URL      string
-	OutDir   string
-	Filename string
-	Client   *youtube.Client
+	URL string
+
+	OutputDir  string
+	OutputName string
+	Timeout    time.Duration
 }
 
-func Download(ctx context.Context, opt DownloadOptions) (string, error) {
+type Result struct {
+	VideoID    string
+	Title      string
+	Author     string
+	FilePath   string
+	FileName   string
+	MimeType   string
+	Quality    string
+	Itag       int
+	ContentLen int64
+}
 
-	opt.URL = NormalizeURL(opt.URL)
-
-	if strings.TrimSpace(opt.URL) == "" {
-		return "", fmt.Errorf("missing url")
+func Download(opts DownloadOptions) (*Result, error) {
+	if strings.TrimSpace(opts.URL) == "" {
+		return nil, errors.New("ytdl: missing URL")
 	}
 
-	outDir := strings.TrimSpace(opt.OutDir)
-	if outDir == "" {
-		outDir = "."
+	ctx := context.Background()
+	if opts.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
+		defer cancel()
 	}
 
-	client := opt.Client
-	if client == nil {
-		client = &youtube.Client{}
-	}
+	client := &youtube.Client{}
 
-	video, err := client.GetVideoContext(ctx, opt.URL)
+	video, err := client.GetVideoContext(ctx, opts.URL)
 	if err != nil {
-		return "", fmt.Errorf("get video: %w", err)
+		return nil, fmt.Errorf("ytdl: get video: %w", err)
 	}
 
-	format := pickBestMuxed(video.Formats)
+	format := bestProgressive(video.Formats)
 	if format == nil {
-		return "", fmt.Errorf("no suitable muxed format found")
+		return nil, errors.New("ytdl: no progressive stream found")
 	}
 
-	name := strings.TrimSpace(opt.Filename)
-	if name == "" {
-		name = slug(video.Title)
-	}
-	if name == "" {
-		name = "video"
-	}
-
-	ext := extFromMime(format.MimeType)
-	final := filepath.Join(outDir, name+ext)
-	part := final + ".part"
-
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return "", fmt.Errorf("create output directory: %w", err)
-	}
-
-	stream, _, err := client.GetStreamContext(ctx, video, format)
+	stream, size, err := client.GetStreamContext(ctx, video, format)
 	if err != nil {
-		return "", fmt.Errorf("get stream: %w", err)
+		return nil, fmt.Errorf("ytdl: get stream: %w", err)
 	}
 	defer stream.Close()
 
-	out, err := os.Create(part)
-	if err != nil {
-		return "", fmt.Errorf("create output file: %w", err)
+	dir := opts.OutputDir
+	if dir == "" {
+		dir = "."
 	}
 
-	ok := false
-	defer func() {
-		_ = out.Close()
-		if !ok {
-			_ = os.Remove(part)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("ytdl: create output dir: %w", err)
+	}
+
+	name := opts.OutputName
+	if name == "" {
+		ext := extensionFromMime(format.MimeType)
+		if ext == "" {
+			ext = ".mp4"
 		}
-	}()
+		name = safeFilename(video.Title) + ext
+	}
+
+	path := filepath.Join(dir, name)
+
+	out, err := os.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("ytdl: create file: %w", err)
+	}
+	defer out.Close()
 
 	if _, err := io.Copy(out, stream); err != nil {
-		return "", fmt.Errorf("download stream: %w", err)
+		return nil, fmt.Errorf("ytdl: write file: %w", err)
 	}
 
-	if err := out.Close(); err != nil {
-		return "", fmt.Errorf("close output file: %w", err)
-	}
-
-	if err := os.Rename(part, final); err != nil {
-		return "", fmt.Errorf("rename output file: %w", err)
-	}
-
-	ok = true
-
-	abs, err := filepath.Abs(final)
-	if err != nil {
-		return final, nil
-	}
-
-	return abs, nil
+	return &Result{
+		VideoID:    video.ID,
+		Title:      video.Title,
+		Author:     video.Author,
+		FilePath:   path,
+		FileName:   name,
+		MimeType:   format.MimeType,
+		Quality:    format.Quality,
+		Itag:       format.ItagNo,
+		ContentLen: size,
+	}, nil
 }
 
-func pickBestMuxed(formats youtube.FormatList) *youtube.Format {
+func bestProgressive(formats youtube.FormatList) *youtube.Format {
 	var best *youtube.Format
+	bestScore := -1
 
 	for i := range formats {
 		f := &formats[i]
 
-		if f.AudioChannels == 0 {
+		// Progressive means audio + video together.
+		if f.AudioChannels <= 0 {
 			continue
 		}
 
-		mime := strings.ToLower(f.MimeType)
-		if !strings.Contains(mime, "video/") {
-			continue
-		}
-
-		if best == nil {
-			best = f
-			continue
-		}
-
-		bestMP4 := strings.Contains(strings.ToLower(best.MimeType), "mp4")
-		thisMP4 := strings.Contains(mime, "mp4")
-
-		switch {
-		case thisMP4 && !bestMP4:
-			best = f
-		case thisMP4 == bestMP4 && f.Height > best.Height:
-			best = f
-		case thisMP4 == bestMP4 && f.Height == best.Height && f.Bitrate > best.Bitrate:
+		score := scoreFormat(f)
+		if score > bestScore {
+			bestScore = score
 			best = f
 		}
 	}
@@ -140,32 +129,84 @@ func pickBestMuxed(formats youtube.FormatList) *youtube.Format {
 	return best
 }
 
-func extFromMime(mime string) string {
-	mime = strings.ToLower(mime)
+func scoreFormat(f *youtube.Format) int {
+	score := 0
 
+	score += parseQuality(f.Quality) * 1000
+
+	if strings.Contains(strings.ToLower(f.MimeType), "video/mp4") {
+		score += 100
+	}
+
+	score += f.Bitrate / 1000
+	score += f.AudioChannels * 10
+
+	return score
+}
+
+var qualityRE = regexp.MustCompile(`(\d+)`)
+
+func parseQuality(q string) int {
+	m := qualityRE.FindStringSubmatch(strings.ToLower(q))
+	if len(m) < 2 {
+		switch strings.ToLower(q) {
+		case "small":
+			return 240
+		case "medium":
+			return 360
+		case "large":
+			return 480
+		case "hd720":
+			return 720
+		case "hd1080":
+			return 1080
+		default:
+			return 0
+		}
+	}
+
+	var n int
+	fmt.Sscanf(m[1], "%d", &n)
+	return n
+}
+
+func extensionFromMime(mime string) string {
+	m := strings.ToLower(mime)
 	switch {
-	case strings.Contains(mime, "mp4"):
+	case strings.Contains(m, "mp4"):
 		return ".mp4"
-	case strings.Contains(mime, "webm"):
+	case strings.Contains(m, "webm"):
 		return ".webm"
-	case strings.Contains(mime, "3gpp"):
+	case strings.Contains(m, "3gpp"):
 		return ".3gp"
 	default:
-		return ".bin"
+		return ""
 	}
 }
 
-func slug(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	s = strings.ReplaceAll(s, "&", " and ")
-	s = strings.ReplaceAll(s, "+", " plus ")
+func safeFilename(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "video"
+	}
 
-	reBad := regexp.MustCompile(`[^a-z0-9]+`)
-	s = reBad.ReplaceAllString(s, "-")
-	s = strings.Trim(s, "-")
+	replacer := strings.NewReplacer(
+		"/", "-",
+		"\\", "-",
+		":", " -",
+		"*", "",
+		"?", "",
+		"\"", "'",
+		"<", "",
+		">", "",
+		"|", "-",
+	)
+	s = replacer.Replace(s)
+	s = strings.Join(strings.Fields(s), " ")
+	s = strings.Trim(s, ". ")
 
-	reDash := regexp.MustCompile(`-+`)
-	s = reDash.ReplaceAllString(s, "-")
-
+	if s == "" {
+		return "video"
+	}
 	return s
 }

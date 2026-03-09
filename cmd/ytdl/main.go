@@ -1,21 +1,30 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
+	"os"
+	"time"
 
 	"github.com/rwxrob/ytdl"
 )
 
 func main() {
-	path, err := ytdl.Download(context.Background(), ytdl.DownloadOptions{
-		URL:    "https://www.youtube.com/watch?v=BaW_jenozKc",
-		OutDir: "downloads",
+	if len(os.Args) != 2 {
+		fmt.Fprintf(os.Stderr, "usage: %s <youtube-url>\n", os.Args[0])
+		os.Exit(1)
+	}
+
+	url := os.Args[1]
+
+	res, err := ytdl.Download(ytdl.DownloadOptions{
+		URL:       url,
+		OutputDir: ".",
+		Timeout:   30 * time.Minute,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Println(path)
+	fmt.Printf("downloaded: %s\n", res.FilePath)
 }
