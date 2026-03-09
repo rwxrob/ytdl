@@ -79,7 +79,7 @@ func Download(opts DownloadOptions) (*Result, error) {
 		if ext == "" {
 			ext = ".mp4"
 		}
-		name = safeFilename(video.Title) + ext
+		name = slug(video.Title) + ext
 	}
 
 	path := filepath.Join(dir, name)
@@ -184,29 +184,36 @@ func extensionFromMime(mime string) string {
 	}
 }
 
-func safeFilename(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
+func slug(s string) string {
+	s = strings.ToLower(s)
+
+	var b strings.Builder
+	lastDash := false
+
+	for _, r := range s {
+
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+			lastDash = false
+
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+			lastDash = false
+
+		default:
+			if !lastDash {
+				b.WriteRune('-')
+				lastDash = true
+			}
+		}
+	}
+
+	out := strings.Trim(b.String(), "-")
+
+	if out == "" {
 		return "video"
 	}
 
-	replacer := strings.NewReplacer(
-		"/", "-",
-		"\\", "-",
-		":", " -",
-		"*", "",
-		"?", "",
-		"\"", "'",
-		"<", "",
-		">", "",
-		"|", "-",
-	)
-	s = replacer.Replace(s)
-	s = strings.Join(strings.Fields(s), " ")
-	s = strings.Trim(s, ". ")
-
-	if s == "" {
-		return "video"
-	}
-	return s
+	return out
 }
